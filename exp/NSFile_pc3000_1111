@@ -1,0 +1,31 @@
+set ns [new Simulator]
+source tb_compat.tcl
+
+set node1 [$ns node]
+tb-set-node-os $node1 UBUNTU18-64-STD
+tb-set-hardware $node1 pc3000
+
+set node2 [$ns node]
+tb-set-node-os $node2 UBUNTU18-64-STD
+tb-set-hardware $node2 pc3000
+
+set node3 [$ns node]
+tb-set-node-os $node3 UBUNTU18-64-STD
+tb-set-hardware $node3 pc3000
+
+set node4 [$ns node]
+tb-set-node-os $node4 UBUNTU18-64-STD
+tb-set-hardware $node4 pc3000
+
+set node5 [$ns node]
+tb-set-node-os $node5 UBUNTU18-64-STD
+tb-set-hardware $node5 pc3000
+
+set node6 [$ns node]
+tb-set-node-os $node6 UBU18-LK415-MSCOPE01
+tb-set-hardware $node6 d430
+
+set lan1 [$ns make-lan "$node1 $node2 $node3 $node4 $node5" 100Mb 0ms]
+
+$ns rtproto Static
+$ns run

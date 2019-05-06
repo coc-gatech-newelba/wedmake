@@ -1,0 +1,2939 @@
+# RUBBoS application benchmark.
+---
+initial_guard:
+  - $WEB_NET_NODES != ""
+  - $WEB_NET_USERNAME != ""
+  - $APP_NET_NODES != ""
+  - $APP_NET_USERNAME != ""
+  - $MIDDL_NET_NODE != ""
+  - $MIDDL_NET_USERNAME != ""
+  - $DB_NET_NODES != ""
+  - $DB_NET_USERNAME != ""
+  - $CLIENT_NET_NODES != ""
+  - $CLIENT_NET_USERNAME != ""
+  - $BENCH_NET_NODE != ""
+  - $BENCH_NET_USERNAME != ""
+
+final_guard:
+  - $WEB_NNODES != ""
+  - $APP_NNODES != ""
+  - $DB_NNODES != ""
+  - $CLIENT_NNODES != ""
+  - $BENCH_RESULTSTARBALL != ""
+
+tasks:
+# Count the number of web server nodes.
+- name: WebCountNodes
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NNODES = ""
+  bash: |
+    WEB_NNODES=0
+    local web_net_node
+    for web_net_node in $WEB_NET_NODES; do
+      let WEB_NNODES=WEB_NNODES+1
+    done
+    readonly WEB_NNODES
+
+# Reboot web server nodes.
+- name: WebReboot
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_DISKPARTITION != ""
+    - $WEB_CPUFREQGOVERNOR in ['-', 'powersave', 'performance', 'ondemand']
+    - $WEB_HARDWARE_REBOOTED = ""
+  bash: |
+    readonly WEB_HARDWARE_REBOOTED="true"
+    local web_net_node
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        if [ $WEB_CPUFREQGOVERNOR != '-' ]; then
+          sudo apt-get update
+          sudo apt-get -y install cpufrequtils
+          echo 'GOVERNOR=\"$WEB_CPUFREQGOVERNOR\"' | sudo tee /etc/default/cpufrequtils
+          sudo systemctl disable ondemand
+        fi
+        nohup sudo systemctl reboot -i &>/dev/null & exit
+      "
+    done
+    sleep 240
+
+# Create a new disk partition (128 GB) in web server nodes.
+- name: WebCreateDiskPartition
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $WEB_FS_DISKPARTITION = ""
+  bash: |
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    local disk
+    local pno
+    if [ $WEB_HARDWARE_TYPE = 'pc3000' ]; then
+      disk="/dev/sda"
+      pno=4
+      readonly WEB_FS_DISKPARTITION="/dev/sda4"
+    elif [ $WEB_HARDWARE_TYPE = 'c8220' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly WEB_FS_DISKPARTITION="/dev/sdb1"
+    elif [ $WEB_HARDWARE_TYPE = 'd430' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly WEB_FS_DISKPARTITION="/dev/sdb1"
+    fi
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        echo -e \"n\np\n$pno\n\n+128G\nw\n\" | sudo fdisk $disk
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Make a ext3 filesystem on the created disk partition and mount it at the root directory in web server nodes.
+- name: WebMountExt3FilesystemAtRootDir
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_DISKPARTITION != ""
+    - $WEB_HARDWARE_REBOOTED = "true"
+    - $WEB_FS_ROOTDIR = ""
+  bash: |
+    readonly WEB_FS_ROOTDIR="/mnt/experiment"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        sudo mkfs -F -t ext3 $WEB_FS_DISKPARTITION
+        sudo mkdir -p $WEB_FS_ROOTDIR
+        sudo mount $WEB_FS_DISKPARTITION $WEB_FS_ROOTDIR
+        sudo chown $WEB_NET_USERNAME $WEB_FS_ROOTDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Create a directory tree structure in web server nodes.
+- name: WebCreateDirectoryTreeStructure
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_ROOTDIR != ""
+    - $WEB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $WEB_FS_SOFTWAREDIR = ""
+    - $WEB_FS_LIBDIR = ""
+    - $WEB_FS_UTILDIR = ""
+    - $WEB_FS_RESULTSDIR = ""
+    - $WEB_FS_ARTIFACTSDIR = ""
+  bash: |
+    readonly WEB_FS_SOFTWAREDIR="$WEB_FS_ROOTDIR/software"
+    readonly WEB_FS_LIBDIR="$WEB_FS_ROOTDIR/lib"
+    readonly WEB_FS_UTILDIR="$WEB_FS_ROOTDIR/util"
+    readonly WEB_FS_RESULTSDIR="$WEB_FS_ROOTDIR/results"
+    readonly WEB_FS_ARTIFACTSDIR="$WEB_FS_ROOTDIR/artifacts"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        mkdir -p $WEB_FS_SOFTWAREDIR
+        mkdir -p $WEB_FS_LIBDIR
+        mkdir -p $WEB_FS_UTILDIR
+        mkdir -p $WEB_FS_RESULTSDIR
+        mkdir -p $WEB_FS_ARTIFACTSDIR
+        if [ $WEB_CLOUD_NAME = 'emulab' ]; then
+          tar -xzf /proj/Infosphere/ral/rubbos_artifacts.tar.gz -C $WEB_FS_ARTIFACTSDIR
+        elif [ $WEB_CLOUD_NAME = 'cloudlab' ]; then
+          tar -xzf /proj/infosphere-PG0/ral/rubbos_artifacts.tar.gz -C $WEB_FS_ARTIFACTSDIR
+        fi
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install sdparm in web server nodes.
+# Version: 1.10
+- name: WebInstallSdparm110
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_UTILDIR != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_HARDWARE_WCEMODE = "disable"
+    - $WEB_SDPARM_VERSION = "1.10"
+    - $WEB_SDPARM_EXECFILE = ""
+  bash: |
+    readonly WEB_SDPARM_EXECFILE="/usr/local/bin/sdparm"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        tar -xzf $WEB_FS_ARTIFACTSDIR/util/sdparm-${WEB_SDPARM_VERSION}.tgz -C $WEB_FS_UTILDIR
+        cd $WEB_FS_UTILDIR/sdparm*
+        ./configure
+        make
+        sudo make install
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Disable "Write Cache Enabled" (WCE) mode in web server nodes.
+- name: WebDisableWceMode
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_SDPARM_EXECFILE != ""
+    - $WEB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $WEB_HARDWARE_WCEMODE = "disable"
+  bash: |
+    readonly WEB_HARDWARE_WCEMODE="disabled"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        sudo $WEB_SDPARM_EXECFILE -c WCE /dev/sda
+        #sudo $WEB_SDPARM_EXECFILE -c WCE /dev/sdb
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Collectl in web server nodes.
+# Version: 4.0.4
+- name: WebInstallCollectl404
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_COLLECTL_VERSION = "4.0.4"
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_COLLECTL_EXECFILE = ""
+  bash: |
+    readonly WEB_COLLECTL_EXECFILE="/usr/bin/collectl"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        tar -xzf $WEB_FS_ARTIFACTSDIR/elba/mScopeResourceMonitors/collectl-${WEB_COLLECTL_VERSION}.src.tar.gz -C \
+            $WEB_FS_SOFTWAREDIR
+        cd $WEB_FS_SOFTWAREDIR/collectl*
+        sudo ./INSTALL
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize Collectl in web server nodes.
+# Version: 4.0.4
+- name: WebInitializeCollectl404
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_COLLECTL_VERSION = "4.0.4"
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_COLLECTL_EXECFILE != ""
+    - $WEB_COLLECTL_INITIALIZEDAT = ""
+  bash: |
+    readonly WEB_COLLECTL_INITIALIZEDAT="$(date -u)"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        mkdir -p $WEB_FS_SOFTWAREDIR/collectl/data
+        nohup sudo nice -n -1 $WEB_COLLECTL_EXECFILE -sCDmnt -i.05 -oTm -P \
+            -f $WEB_FS_SOFTWAREDIR/collectl/data/coll > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Stop Collectl in web server nodes.
+# Version: 4.0.4
+- name: WebStopCollectl404
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_COLLECTL_VERSION = "4.0.4"
+    - $BENCH_FINISHEDAT != ""
+    - $WEB_COLLECTL_STOPPEDAT = ""
+  bash: |
+    readonly WEB_COLLECTL_STOPPEDAT="$(date -u)"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        sudo pkill collectl
+        sleep 2
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect Collectl results in web server nodes.
+# Version: 4.0.4
+- name: WebCollectResultsCollectl404
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_COLLECTL_VERSION = "4.0.4"
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_FS_RESULTSDIR != ""
+    - $WEB_COLLECTL_STOPPEDAT != ""
+    - $WEB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $WEB_COLLECTL_RESULTSDIR = ""
+  bash: |
+    readonly WEB_COLLECTL_RESULTSDIR="$WEB_FS_RESULTSDIR/collectl"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        mkdir -p $WEB_COLLECTL_RESULTSDIR
+        cp $WEB_FS_SOFTWAREDIR/collectl/data/coll-* $WEB_COLLECTL_RESULTSDIR
+        gzip -d $WEB_COLLECTL_RESULTSDIR/coll-*
+        cd $WEB_COLLECTL_RESULTSDIR
+        for result in \$(ls coll-*); do
+          if [ $WEB_CLOUD_NAME = 'emulab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"_COLL_\"\$(NF)\".data\"}')
+          elif [ $WEB_CLOUD_NAME = 'cloudlab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"-\"\$3\"_COLL_\"\$(NF)\".data\"}')
+          fi
+        done
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install RUBBoS in web server nodes.
+- name: WebInstallRubbos
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_RUBBOS_HOMEDIR = ""
+  bash: |
+    readonly WEB_RUBBOS_HOMEDIR="$WEB_FS_SOFTWAREDIR/rubbos_yasu"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        tar -xzf $WEB_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/rubbos_yasu.tar.gz -C $WEB_FS_SOFTWAREDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Apache HTTP server in web server nodes.
+# Version: 2.2.22
+- name: WebInstallApacheHttpServer2222
+  guard:
+    - $WEB_NET_USERNAME != ""
+    - $WEB_NET_NODES != ""
+    - $WEB_HTTPD_VERSION = "2.2.22"
+    - $WEB_HTTPD_MULTIPROCESSINGMODE = "worker"
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_HTTPD_HOMEDIR = ""
+  bash: |
+    readonly WEB_HTTPD_HOMEDIR="$WEB_FS_SOFTWAREDIR/httpd"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        tar -xzf $WEB_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/httpd-${WEB_HTTPD_VERSION}.tar.gz -C $WEB_FS_SOFTWAREDIR
+        mv $WEB_FS_SOFTWAREDIR/httpd* $WEB_HTTPD_HOMEDIR
+        cd $WEB_HTTPD_HOMEDIR
+        ./configure --prefix=$WEB_HTTPD_HOMEDIR --enable-so --with-mpm=$WEB_HTTPD_MULTIPROCESSINGMODE
+        make
+        make install
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install mod_jk in web server nodes.
+# Version: 1.2.32
+- name: WebInstallModJk1232
+  guard:
+    - $WEB_NET_USERNAME != ""
+    - $WEB_NET_NODES != ""
+    - $WEB_MODJK_VERSION = "1.2.32"
+    - $WEB_FS_SOFTWAREDIR != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_MODJK_MODULEPATH = ""
+  bash: |
+    readonly WEB_MODJK_MODULEPATH="$WEB_HTTPD_HOMEDIR/modules/mod_jk.so"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        tar -xzf $WEB_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/tomcat-connectors-${WEB_MODJK_VERSION}-src.tar.gz -C \
+            $WEB_FS_SOFTWAREDIR
+        mv $WEB_FS_SOFTWAREDIR/tomcat-connectors* $WEB_FS_SOFTWAREDIR/modjk
+        cd $WEB_FS_SOFTWAREDIR/modjk/native
+        ./configure --with-apxs=$WEB_HTTPD_HOMEDIR/bin/apxs
+        make
+        make install
+        cp $WEB_FS_SOFTWAREDIR/modjk/native/apache-2.0/mod_jk.so $WEB_HTTPD_HOMEDIR/modules
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Configure Apache HTTP server in web server nodes.
+# Version: 2.2.22
+- name: WebConfigureApacheHttpServer2222
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $WEB_HTTPD_VERSION = "2.2.22"
+    - $WEB_HTTPD_MULTIPROCESSINGMODE = "worker"
+    - $WEB_HTTPD_TIMEOUT != ""
+    - $WEB_HTTPD_KEEPALIVE != ""
+    - $WEB_HTTPD_MAXKEEPALIVEREQUESTS != ""
+    - $WEB_HTTPD_KEEPALIVETIMEOUT != ""
+    - $WEB_HTTPD_SERVERLIMIT != ""
+    - $WEB_HTTPD_THREADLIMIT != ""
+    - $WEB_HTTPD_STARTSERVERS != ""
+    - $WEB_HTTPD_MAXCLIENTS != ""
+    - $WEB_HTTPD_MINSPARETHREADS != ""
+    - $WEB_HTTPD_MAXSPARETHREADS != ""
+    - $WEB_HTTPD_THREADSPERCHILD != ""
+    - $WEB_HTTPD_MAXREQUESTSPERCHILD != ""
+    - $WEB_HTTPD_LOGRESPONSETIME != ""
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_MODJK_MODULEPATH != ""
+    - $WEB_MODJK_WORKERPROPERTIESPATH != ""
+    - $WEB_NET_PORT = ""
+    - $WEB_HTTPD_CONFPATH = ""
+  bash: |
+    readonly WEB_NET_PORT="8000"
+    readonly WEB_HTTPD_CONFPATH="$WEB_HTTPD_HOMEDIR/conf/httpd.conf"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        export WEB_HTTPD_MULTIPROCESSINGMODE=\"$WEB_HTTPD_MULTIPROCESSINGMODE\"
+        export WEB_HTTPD_TIMEOUT=\"$WEB_HTTPD_TIMEOUT\"
+        export WEB_HTTPD_KEEPALIVE=\"$WEB_HTTPD_KEEPALIVE\"
+        export WEB_HTTPD_MAXKEEPALIVEREQUESTS=\"$WEB_HTTPD_MAXKEEPALIVEREQUESTS\"
+        export WEB_HTTPD_KEEPALIVETIMEOUT=\"$WEB_HTTPD_KEEPALIVETIMEOUT\"
+        export WEB_HTTPD_SERVERLIMIT=\"$WEB_HTTPD_SERVERLIMIT\"
+        export WEB_HTTPD_THREADLIMIT=\"$WEB_HTTPD_THREADLIMIT\"
+        export WEB_HTTPD_STARTSERVERS=\"$WEB_HTTPD_STARTSERVERS\"
+        export WEB_HTTPD_MAXCLIENTS=\"$WEB_HTTPD_MAXCLIENTS\"
+        export WEB_HTTPD_MINSPARETHREADS=\"$WEB_HTTPD_MINSPARETHREADS\"
+        export WEB_HTTPD_MAXSPARETHREADS=\"$WEB_HTTPD_MAXSPARETHREADS\"
+        export WEB_HTTPD_THREADSPERCHILD=\"$WEB_HTTPD_THREADSPERCHILD\"
+        export WEB_HTTPD_MAXREQUESTSPERCHILD=\"$WEB_HTTPD_MAXREQUESTSPERCHILD\"
+        export WEB_HTTPD_LOGRESPONSETIME=\"$WEB_HTTPD_LOGRESPONSETIME\"
+        export WEB_HTTPD_HOMEDIR=\"$WEB_HTTPD_HOMEDIR\"
+        export WEB_NET_PORT=\"$WEB_NET_PORT\"
+        export WEB_MODJK_MODULEPATH=\"$WEB_MODJK_MODULEPATH\"
+        export WEB_MODJK_WORKERPROPERTIESPATH=\"$WEB_MODJK_WORKERPROPERTIESPATH\"
+        $WEB_FS_ARTIFACTSDIR/template/httpd-${WEB_HTTPD_VERSION}/httpd.conf.sh > $WEB_HTTPD_CONFPATH
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Configure mod_jk in web server nodes.
+# Version: 1.2.32
+- name: WebConfigureModJk1232
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_MODJK_VERSION = "1.2.32"
+    - $WEB_FS_ARTIFACTSDIR != ""
+    - $APP_NET_NODES != ""
+    - $APP_NET_PORT != ""
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_MODJK_WORKERPROPERTIESPATH = ""
+  bash: |
+    readonly WEB_MODJK_WORKERPROPERTIESPATH="$WEB_HTTPD_HOMEDIR/conf/worker.properties"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        mkdir -p $WEB_HTTPD_HOMEDIR/conf
+        export APP_NET_NODES=\"$APP_NET_NODES\"
+        export APP_NET_PORT=\"$APP_NET_PORT\"
+        $WEB_FS_ARTIFACTSDIR/template/modjk-${WEB_MODJK_VERSION}/worker.properties.sh > $WEB_MODJK_WORKERPROPERTIESPATH
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize Apache HTTP server in web server nodes.
+# Version: 2.2.22
+- name: WebInitializeApacheHttpServer2222
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_HTTPD_VERSION = "2.2.22"
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_HTTPD_CONFPATH != ""
+    - $WEB_RUBBOS_HOMEDIR != ""
+    - $APP_INITIALIZEDAT != ""
+    - $WEB_INITIALIZEDAT = ""
+  bash: |
+    readonly WEB_INITIALIZEDAT="$(date -u)"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        ulimit -n \$(ulimit -Hn)
+        ln -s $WEB_RUBBOS_HOMEDIR/servlets/web $WEB_HTTPD_HOMEDIR/htdocs/rubbos
+        nohup $WEB_HTTPD_HOMEDIR/bin/apachectl -f $WEB_HTTPD_CONFPATH -k start > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+    sleep 16
+
+# Stop Apache HTTP server in web server nodes.
+# Version: 2.2.22
+- name: WebStopApacheHttpServer2222
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_HTTPD_VERSION = "2.2.22"
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_HTTPD_CONFPATH != ""
+    - $BENCH_FINISHEDAT != ""
+    - $WEB_HTTPD_STOPPEDAT = ""
+  bash: |
+    readonly WEB_HTTPD_STOPPEDAT="$(date -u)"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        $WEB_HTTPD_HOMEDIR/bin/apachectl -f $WEB_HTTPD_CONFPATH -k stop
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect Apache HTTP server results in web server nodes.
+# Version: 2.2.22
+- name: WebCollectResultsApacheHttpServer2222
+  guard:
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_HTTPD_VERSION = "2.2.22"
+    - $WEB_HTTPD_HOMEDIR != ""
+    - $WEB_FS_RESULTSDIR != ""
+    - $WEB_HTTPD_STOPPEDAT != ""
+    - $WEB_HTTPD_RESULTSDIR = ""
+  bash: |
+    readonly WEB_HTTPD_RESULTSDIR="$WEB_FS_RESULTSDIR/httpd"
+    local web_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        mkdir -p $WEB_HTTPD_RESULTSDIR
+        cp $WEB_HTTPD_HOMEDIR/logs/access_log $WEB_HTTPD_RESULTSDIR/\$(hostname -s)_HTTPD_mscope_access.log
+        cp $WEB_HTTPD_HOMEDIR/logs/mod_jk.log $WEB_HTTPD_RESULTSDIR/\$(hostname -s)_HTTPD_modjk.log
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Count the number of application server nodes.
+- name: AppCountNodes
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NNODES = ""
+  bash: |
+    APP_NNODES=0
+    local app_net_node
+    for app_net_node in $APP_NET_NODES; do
+      let APP_NNODES=APP_NNODES+1
+    done
+    readonly APP_NNODES
+
+# Reboot application server nodes.
+- name: AppReboot
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_DISKPARTITION != ""
+    - $APP_CPUFREQGOVERNOR in ['-', 'powersave', 'performance', 'ondemand']
+    - $APP_HARDWARE_REBOOTED = ""
+  bash: |
+    readonly APP_HARDWARE_REBOOTED="true"
+    local app_net_node
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        if [ $APP_CPUFREQGOVERNOR != '-' ]; then
+          sudo apt-get update
+          sudo apt-get -y install cpufrequtils
+          echo 'GOVERNOR=\"$APP_CPUFREQGOVERNOR\"' | sudo tee /etc/default/cpufrequtils
+          sudo systemctl disable ondemand
+        fi
+        nohup sudo systemctl reboot -i &>/dev/null & exit
+      "
+    done
+    sleep 240
+
+# Create a new disk partition /dev/sdb1 (128 GB) in application server nodes.
+- name: AppCreateDiskPartition
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $APP_FS_DISKPARTITION = ""
+  bash: |
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    local disk
+    local pno
+    if [ $APP_HARDWARE_TYPE = 'pc3000' ]; then
+      disk="/dev/sda"
+      pno=4
+      readonly APP_FS_DISKPARTITION="/dev/sda4"
+    elif [ $APP_HARDWARE_TYPE = 'c8220' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly APP_FS_DISKPARTITION="/dev/sdb1"
+    elif [ $APP_HARDWARE_TYPE = 'd430' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly APP_FS_DISKPARTITION="/dev/sdb1"
+    fi
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        echo -e \"n\np\n$pno\n\n+128G\nw\n\" | sudo fdisk $disk
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Make a ext3 filesystem on the created disk partition and mount it at the root directory in application server nodes.
+- name: AppMountExt3FilesystemAtRootDir
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_DISKPARTITION != ""
+    - $APP_HARDWARE_REBOOTED = "true"
+    - $APP_FS_ROOTDIR = ""
+  bash: |
+    readonly APP_FS_ROOTDIR="/mnt/experiment"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        sudo mkfs -F -t ext3 $APP_FS_DISKPARTITION
+        sudo mkdir -p $APP_FS_ROOTDIR
+        sudo mount $APP_FS_DISKPARTITION $APP_FS_ROOTDIR
+        sudo chown $APP_NET_USERNAME $APP_FS_ROOTDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Create a directory tree structure in application server nodes.
+- name: AppCreateDirectoryTreeStructure
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_ROOTDIR != ""
+    - $APP_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $APP_FS_SOFTWAREDIR = ""
+    - $APP_FS_LIBDIR = ""
+    - $APP_FS_UTILDIR = ""
+    - $APP_FS_RESULTSDIR = ""
+    - $APP_FS_ARTIFACTSDIR = ""
+  bash: |
+    readonly APP_FS_SOFTWAREDIR="$APP_FS_ROOTDIR/software"
+    readonly APP_FS_LIBDIR="$APP_FS_ROOTDIR/lib"
+    readonly APP_FS_UTILDIR="$APP_FS_ROOTDIR/util"
+    readonly APP_FS_RESULTSDIR="$APP_FS_ROOTDIR/results"
+    readonly APP_FS_ARTIFACTSDIR="$APP_FS_ROOTDIR/artifacts"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        mkdir -p $APP_FS_SOFTWAREDIR
+        mkdir -p $APP_FS_LIBDIR
+        mkdir -p $APP_FS_UTILDIR
+        mkdir -p $APP_FS_RESULTSDIR
+        mkdir -p $APP_FS_ARTIFACTSDIR
+        if [ $APP_CLOUD_NAME = 'emulab' ]; then
+          tar -xzf /proj/Infosphere/ral/rubbos_artifacts.tar.gz -C $APP_FS_ARTIFACTSDIR
+        elif [ $APP_CLOUD_NAME = 'cloudlab' ]; then
+          tar -xzf /proj/infosphere-PG0/ral/rubbos_artifacts.tar.gz -C $APP_FS_ARTIFACTSDIR
+        fi
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install sdparm in application server nodes.
+# Version: 1.10
+- name: AppInstallSdparm110
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_UTILDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_HARDWARE_WCEMODE = "disable"
+    - $APP_SDPARM_VERSION = "1.10"
+    - $APP_SDPARM_EXECFILE = ""
+  bash: |
+    readonly APP_SDPARM_EXECFILE="/usr/local/bin/sdparm"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/util/sdparm-${APP_SDPARM_VERSION}.tgz -C $APP_FS_UTILDIR
+        cd $APP_FS_UTILDIR/sdparm*
+        ./configure
+        make
+        sudo make install
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Disable "Write Cache Enabled" (WCE) mode in application server nodes.
+- name: AppDisableWceMode
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_SDPARM_EXECFILE != ""
+    - $APP_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $APP_HARDWARE_WCEMODE = "disable"
+  bash: |
+    readonly APP_HARDWARE_WCEMODE="disabled"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        sudo $APP_SDPARM_EXECFILE -c WCE /dev/sda
+        #sudo $APP_SDPARM_EXECFILE -c WCE /dev/sdb
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Collectl in application server nodes.
+# Version: 4.0.4
+- name: AppInstallCollectl404
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_COLLECTL_VERSION = "4.0.4"
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_COLLECTL_EXECFILE = ""
+  bash: |
+    readonly APP_COLLECTL_EXECFILE="/usr/bin/collectl"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/elba/mScopeResourceMonitors/collectl-${APP_COLLECTL_VERSION}.src.tar.gz -C \
+            $APP_FS_SOFTWAREDIR
+        cd $APP_FS_SOFTWAREDIR/collectl*
+        sudo ./INSTALL
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize Collectl in application server nodes.
+# Version: 4.0.4
+- name: AppInitializeCollectl404
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_COLLECTL_VERSION = "4.0.4"
+    - $APP_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_COLLECTL_EXECFILE != ""
+    - $APP_COLLECTL_INITIALIZEDAT = ""
+  bash: |
+    readonly APP_COLLECTL_INITIALIZEDAT="$(date -u)"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        # Disable cores
+        if [ $APP_HARDWARE_TYPE = 'd430' ]; then
+          for i in \$(seq 2 31); do echo 0 | sudo tee /sys/devices/system/cpu/cpu\$i/online; done
+        elif [ $APP_HARDWARE_TYPE = 'c8220' ]; then
+          for i in \$(seq 2 39); do echo 0 | sudo tee /sys/devices/system/cpu/cpu\$i/online; done
+        fi
+        mkdir -p $APP_FS_SOFTWAREDIR/collectl/data
+        nohup sudo nice -n -1 $APP_COLLECTL_EXECFILE -sCDmnt -i.05 -oTm -P \
+            -f $APP_FS_SOFTWAREDIR/collectl/data/coll > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Stop Collectl in application server nodes.
+# Version: 4.0.4
+- name: AppStopCollectl404
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_COLLECTL_VERSION = "4.0.4"
+    - $BENCH_FINISHEDAT != ""
+    - $APP_COLLECTL_STOPPEDAT = ""
+  bash: |
+    readonly APP_COLLECTL_STOPPEDAT="$(date -u)"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        sudo pkill collectl
+        sleep 2
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect Collectl results in application server nodes.
+# Version: 4.0.4
+- name: AppCollectResultsCollectl404
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_COLLECTL_VERSION = "4.0.4"
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_RESULTSDIR != ""
+    - $APP_COLLECTL_STOPPEDAT != ""
+    - $APP_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $APP_COLLECTL_RESULTSDIR = ""
+  bash: |
+    readonly APP_COLLECTL_RESULTSDIR="$APP_FS_RESULTSDIR/collectl"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        mkdir -p $APP_COLLECTL_RESULTSDIR
+        cp $APP_FS_SOFTWAREDIR/collectl/data/coll-* $APP_COLLECTL_RESULTSDIR
+        gzip -d $APP_COLLECTL_RESULTSDIR/coll-*
+        cd $APP_COLLECTL_RESULTSDIR
+        for result in \$(ls coll-*); do
+          if [ $APP_CLOUD_NAME = 'emulab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"_COLL_\"\$(NF)\".data\"}')
+          elif [ $APP_CLOUD_NAME = 'cloudlab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"-\"\$3\"_COLL_\"\$(NF)\".data\"}')
+          fi
+        done
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Java Development Kit in application server nodes.
+# Version: 1.5.0
+- name: AppInstallJdk150
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_JAVA_VERSION = "1.5.0"
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_JAVA_HOMEDIR = ""
+  bash: |
+    readonly APP_JAVA_HOMEDIR="$APP_FS_SOFTWAREDIR/java"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        sudo apt-get update
+        sudo apt-get -y install libc6:i386
+        tar -xzf $APP_FS_ARTIFACTSDIR/software/jdk-${APP_JAVA_VERSION}.tar.gz -C $APP_FS_SOFTWAREDIR
+        mv $APP_FS_SOFTWAREDIR/jdk* $APP_JAVA_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Java Development Kit in application server nodes.
+# Version: 1.6.0
+- name: AppInstallJdk160
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_JAVA_VERSION = "1.6.0"
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_JAVA_HOMEDIR = ""
+  bash: |
+    readonly APP_JAVA_HOMEDIR="$APP_FS_SOFTWAREDIR/java"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/software/jdk-${APP_JAVA_VERSION}.tar.gz -C $APP_FS_SOFTWAREDIR
+        mv $APP_FS_SOFTWAREDIR/jdk* $APP_JAVA_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install RUBBoS in application server nodes.
+- name: AppInstallRubbos
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_RUBBOS_HOMEDIR = ""
+  bash: |
+    readonly APP_RUBBOS_HOMEDIR="$APP_FS_SOFTWAREDIR/rubbos_yasu"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/rubbos_yasu.tar.gz -C $APP_FS_SOFTWAREDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install log4j in application server nodes.
+# Version: 1.2.17
+- name: AppInstallLog4j1217
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_FS_LIBDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_LOG4J_VERSION = "1.2.17"
+    - $APP_LOG4J_JARPATH = ""
+  bash: |
+    readonly APP_LOG4J_JARPATH="$APP_FS_LIBDIR/log4j/log4j-${APP_LOG4J_VERSION}.jar"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/lib/log4j-${APP_LOG4J_VERSION}.tar.gz -C $APP_FS_LIBDIR
+        mv $APP_FS_LIBDIR/apache-log4j* $APP_FS_LIBDIR/log4j
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Create RUBBoS servlet war.
+- name: AppCreateRubbosServletWar
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_LOGRESPONSETIME != ""
+    - $APP_TOMCAT_HOMEDIR != ""
+    - $APP_TOMCAT_MYSQLPROPERTIESPATH != ""
+    - $APP_JAVA_HOMEDIR != ""
+    - $APP_RUBBOS_HOMEDIR != ""
+    - $APP_LOG4J_JARPATH != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_RUBBOS_SERVLETWARPATH = ""
+  bash: |
+    readonly APP_RUBBOS_SERVLETWARPATH="$APP_RUBBOS_HOMEDIR/servlets/web/rubbos.war"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        export APP_TOMCAT_LOGRESPONSETIME=\"$APP_TOMCAT_LOGRESPONSETIME\"
+        export APP_TOMCAT_HOMEDIR=\"$APP_TOMCAT_HOMEDIR\"
+        export APP_TOMCAT_MYSQLPROPERTIESPATH=\"$APP_TOMCAT_MYSQLPROPERTIESPATH\"
+        $APP_FS_ARTIFACTSDIR/template/rubbos_yasu/Config.java.sh > \
+            $APP_RUBBOS_HOMEDIR/servlets/src/java/edu/rice/rubbos/servlets/Config.java
+        $APP_FS_ARTIFACTSDIR/template/rubbos_yasu/web.xml.sh > $APP_RUBBOS_HOMEDIR/servlets/web/WEB-INF/web.xml
+        $APP_FS_ARTIFACTSDIR/template/rubbos_yasu/log4j.properties.sh > \
+            $APP_RUBBOS_HOMEDIR/servlets/web/WEB-INF/classes/log4j.properties
+        export JAVA_HOME=\"$APP_JAVA_HOMEDIR\"
+        export PATH=\"$APP_JAVA_HOMEDIR/bin:\$PATH\"
+        export CLASSPATH=\"$APP_TOMCAT_HOMEDIR/common/lib/servlet-api.jar:$APP_LOG4J_JARPATH\"
+        javac $APP_RUBBOS_HOMEDIR/servlets/src/java/edu/rice/rubbos/servlets/*.java -d \
+            $APP_RUBBOS_HOMEDIR/servlets/web/WEB-INF/classes
+        cp $APP_LOG4J_JARPATH $APP_RUBBOS_HOMEDIR/servlets/web/WEB-INF/lib
+        cd $APP_RUBBOS_HOMEDIR/servlets/web
+        jar -cf rubbos.war *
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Tomcat in application server nodes.
+# Version: 5.5.17
+- name: AppInstallTomcat5517
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_VERSION = "5.5.17"
+    - $APP_FS_SOFTWAREDIR != ""
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_TOMCAT_HOMEDIR = ""
+  bash: |
+    readonly APP_TOMCAT_HOMEDIR="$APP_FS_SOFTWAREDIR/tomcat"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        tar -xzf $APP_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/apache-tomcat-${APP_TOMCAT_VERSION}.tar.gz -C \
+            $APP_FS_SOFTWAREDIR
+        mv $APP_FS_SOFTWAREDIR/apache-tomcat* $APP_TOMCAT_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Configure Tomcat in application server nodes.
+# Version: 5.5.17
+- name: AppConfigureTomcat5517
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_VERSION = "5.5.17"
+    - $APP_FS_ARTIFACTSDIR != ""
+    - $APP_TOMCAT_HOMEDIR != ""
+    - $APP_TOMCAT_MAXTHREADS != ""
+    - $APP_TOMCAT_MINSPARETHREADS != ""
+    - $APP_TOMCAT_MAXSPARETHREADS != ""
+    - $APP_TOMCAT_ACCEPTCOUNT != ""
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_PORT != ""
+    - $DB_MYSQL_USER != ""
+    - $DB_MYSQL_PASSWORD != ""
+    - $DB_MYSQL_DATABASE != ""
+    - $APP_RUBBOS_HOMEDIR != ""
+    - $APP_NET_PORT = ""
+    - $APP_TOMCAT_SERVERXMLPATH = ""
+    - $APP_TOMCAT_MYSQLPROPERTIESPATH = ""
+  bash: |
+    readonly APP_NET_PORT="8009"
+    readonly APP_TOMCAT_SERVERXMLPATH="$APP_TOMCAT_HOMEDIR/conf/server.xml"
+    readonly APP_TOMCAT_MYSQLPROPERTIESPATH="$APP_RUBBOS_HOMEDIR/servlets/src/conf/mysql.properties"
+    local counter=0
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      let counter=counter+1
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        mkdir -p $APP_RUBBOS_HOMEDIR/servlets/src/conf
+        export counter=\"$counter\"
+        export APP_NET_PORT=\"$APP_NET_PORT\"
+        export APP_TOMCAT_MAXTHREADS=\"$APP_TOMCAT_MAXTHREADS\"
+        export APP_TOMCAT_MINSPARETHREADS=\"$APP_TOMCAT_MINSPARETHREADS\"
+        export APP_TOMCAT_MAXSPARETHREADS=\"$APP_TOMCAT_MAXSPARETHREADS\"
+        export APP_TOMCAT_ACCEPTCOUNT=\"$APP_TOMCAT_ACCEPTCOUNT\"
+        export MIDDL_NET_NODE=\"$MIDDL_NET_NODE\"
+        export MIDDL_NET_PORT=\"$MIDDL_NET_PORT\"
+        export DB_MYSQL_USER=\"$DB_MYSQL_USER\"
+        export DB_MYSQL_PASSWORD=\"$DB_MYSQL_PASSWORD\"
+        export DB_MYSQL_DATABASE=\"$DB_MYSQL_DATABASE\"
+        $APP_FS_ARTIFACTSDIR/template/apache-tomcat-5.5.17/server.xml.sh > $APP_TOMCAT_SERVERXMLPATH
+        $APP_FS_ARTIFACTSDIR/template/rubbos_yasu/mysql.properties.sh > $APP_TOMCAT_MYSQLPROPERTIESPATH
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize Tomcat in application server nodes.
+# Version: 5.5.17
+- name: AppInitializeTomcat5517
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_VERSION = "5.5.17"
+    - $APP_TOMCAT_HOMEDIR != ""
+    - $APP_TOMCAT_SERVERXMLPATH != ""
+    - $APP_JAVA_HOMEDIR != ""
+    - $APP_JAVA_MAXHEAPSIZEINMB != ""
+    - $APP_RUBBOS_SERVLETWARPATH != ""
+    - $MIDDL_INITIALIZEDAT != ""
+    - $APP_INITIALIZEDAT = ""
+  bash: |
+    readonly APP_INITIALIZEDAT="$(date -u)"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        ulimit -n \$(ulimit -Hn)
+        export CATALINA_HOME=\"$APP_TOMCAT_HOMEDIR\"
+        export JAVA_HOME=\"$APP_JAVA_HOMEDIR\"
+        export JAVA_OPTS=\"-Xmx${APP_JAVA_MAXHEAPSIZEINMB}m\"
+        export PATH=\"$APP_JAVA_HOMEDIR/bin:\$PATH\"
+        cp $APP_RUBBOS_SERVLETWARPATH $APP_TOMCAT_HOMEDIR/webapps
+        nohup $APP_TOMCAT_HOMEDIR/bin/startup.sh -f $APP_TOMCAT_SERVERXMLPATH > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+    sleep 16
+
+# Stop Tomcat in application server nodes.
+# Version: 5.5.17
+- name: AppStopTomcat5517
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_VERSION = "5.5.17"
+    - $APP_TOMCAT_HOMEDIR != ""
+    - $APP_JAVA_HOMEDIR != ""
+    - $BENCH_FINISHEDAT != ""
+    - $WEB_HTTPD_STOPPEDAT != ""
+    - $APP_TOMCAT_STOPPEDAT = ""
+  bash: |
+    readonly APP_TOMCAT_STOPPEDAT="$(date -u)"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        export CATALINA_HOME=\"$APP_TOMCAT_HOMEDIR\"
+        export JAVA_HOME=\"$APP_JAVA_HOMEDIR\"
+        export PATH=\"$APP_JAVA_HOMEDIR/bin:\$PATH\"
+        $APP_TOMCAT_HOMEDIR/bin/shutdown.sh
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect Tomcat results in application server nodes.
+# Version: 5.5.17
+- name: AppCollectResultsTomcat5517
+  guard:
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_TOMCAT_VERSION = "5.5.17"
+    - $APP_TOMCAT_HOMEDIR != ""
+    - $APP_FS_RESULTSDIR != ""
+    - $APP_TOMCAT_STOPPEDAT != ""
+    - $APP_TOMCAT_RESULTSDIR = ""
+  bash: |
+    readonly APP_TOMCAT_RESULTSDIR="$APP_FS_RESULTSDIR/tomcat"
+    local app_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        mkdir -p $APP_TOMCAT_RESULTSDIR
+        cp $APP_TOMCAT_HOMEDIR/logs/localhost.* $APP_TOMCAT_RESULTSDIR/\$(hostname -s)_TOMCAT_localhost.log
+        cp $APP_TOMCAT_HOMEDIR/logs/servlets.log $APP_TOMCAT_RESULTSDIR/\$(hostname -s)_TOMCAT_mscope_servlets.log
+        cp $APP_TOMCAT_HOMEDIR/logs/localhost_access_log.* \
+            $APP_TOMCAT_RESULTSDIR/\$(hostname -s)_TOMCAT_mscope_access.log
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Reboot middleware server nodes.
+- name: MiddlReboot
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_FS_DISKPARTITION != ""
+    - $MIDDL_CPUFREQGOVERNOR in ['-', 'powersave', 'performance', 'ondemand']
+    - $MIDDL_HARDWARE_REBOOTED = ""
+  bash: |
+    readonly MIDDL_HARDWARE_REBOOTED="true"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      if [ $MIDDL_CPUFREQGOVERNOR != '-' ]; then
+        sudo apt-get update
+        sudo apt-get -y install cpufrequtils
+        echo 'GOVERNOR=\"$MIDDL_CPUFREQGOVERNOR\"' | sudo tee /etc/default/cpufrequtils
+        sudo systemctl disable ondemand
+      fi
+      nohup sudo systemctl reboot -i &>/dev/null & exit
+    "
+    sleep 240
+
+# Create a new disk partition /dev/sdb1 (128 GB) in middleware server nodes.
+- name: MiddlCreateDiskPartition
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $MIDDL_FS_DISKPARTITION = ""
+  bash: |
+    local disk
+    local pno
+    if [ $MIDDL_HARDWARE_TYPE = 'pc3000' ]; then
+      disk="/dev/sda"
+      pno=4
+      readonly MIDDL_FS_DISKPARTITION="/dev/sda4"
+    elif [ $MIDDL_HARDWARE_TYPE = 'c8220' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly MIDDL_FS_DISKPARTITION="/dev/sdb1"
+    elif [ $MIDDL_HARDWARE_TYPE = 'd430' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly MIDDL_FS_DISKPARTITION="/dev/sdb1"
+    fi
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      echo -e \"n\np\n$pno\n\n+128G\nw\n\" | sudo fdisk $disk
+    "
+
+# Mount the created filesystem at the root directory in middleware server nodes.
+- name: MiddlMountExt3FilesystemAtRootDir
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_FS_DISKPARTITION != ""
+    - $MIDDL_HARDWARE_REBOOTED = "true"
+    - $MIDDL_FS_ROOTDIR = ""
+  bash: |
+    readonly MIDDL_FS_ROOTDIR="/mnt/experiment"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      sudo mkfs -F -t ext3 $MIDDL_FS_DISKPARTITION
+      sudo mkdir -p $MIDDL_FS_ROOTDIR
+      sudo mount $MIDDL_FS_DISKPARTITION $MIDDL_FS_ROOTDIR
+      sudo chown $MIDDL_NET_USERNAME $MIDDL_FS_ROOTDIR
+    "
+
+# Create a directory tree structure in middleware server nodes.
+- name: MiddlCreateDirectoryTreeStructure
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_FS_ROOTDIR != ""
+    - $MIDDL_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $MIDDL_FS_SOFTWAREDIR = ""
+    - $MIDDL_FS_LIBDIR = ""
+    - $MIDDL_FS_UTILDIR = ""
+    - $MIDDL_FS_RESULTSDIR = ""
+    - $MIDDL_FS_ARTIFACTSDIR = ""
+  bash: |
+    readonly MIDDL_FS_SOFTWAREDIR="$MIDDL_FS_ROOTDIR/software"
+    readonly MIDDL_FS_LIBDIR="$MIDDL_FS_ROOTDIR/lib"
+    readonly MIDDL_FS_UTILDIR="$MIDDL_FS_ROOTDIR/util"
+    readonly MIDDL_FS_RESULTSDIR="$MIDDL_FS_ROOTDIR/results"
+    readonly MIDDL_FS_ARTIFACTSDIR="$MIDDL_FS_ROOTDIR/artifacts"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      mkdir -p $MIDDL_FS_SOFTWAREDIR
+      mkdir -p $MIDDL_FS_LIBDIR
+      mkdir -p $MIDDL_FS_UTILDIR
+      mkdir -p $MIDDL_FS_RESULTSDIR
+      mkdir -p $MIDDL_FS_ARTIFACTSDIR
+      if [ $MIDDL_CLOUD_NAME = 'emulab' ]; then
+        tar -xzf /proj/Infosphere/ral/rubbos_artifacts.tar.gz -C $MIDDL_FS_ARTIFACTSDIR
+      elif [ $MIDDL_CLOUD_NAME = 'cloudlab' ]; then
+        tar -xzf /proj/infosphere-PG0/ral/rubbos_artifacts.tar.gz -C $MIDDL_FS_ARTIFACTSDIR
+      fi
+    "
+
+# Install sdparm in middleware server nodes.
+# Version: 1.10
+- name: MiddlInstallSdparm110
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_FS_UTILDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_HARDWARE_WCEMODE = "disable"
+    - $MIDDL_SDPARM_VERSION = "1.10"
+    - $MIDDL_SDPARM_EXECFILE = ""
+  bash: |
+    readonly MIDDL_SDPARM_EXECFILE="/usr/local/bin/sdparm"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/util/sdparm-${MIDDL_SDPARM_VERSION}.tgz -C $MIDDL_FS_UTILDIR
+      cd $MIDDL_FS_UTILDIR/sdparm*
+      ./configure
+      make
+      sudo make install
+    "
+
+# Disable "Write Cache Enabled" (WCE) mode in middleware server nodes.
+- name: MiddlDisableWceMode
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_SDPARM_EXECFILE != ""
+    - $MIDDL_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $MIDDL_HARDWARE_WCEMODE = "disable"
+  bash: |
+    readonly MIDDL_HARDWARE_WCEMODE="disabled"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      sudo $MIDDL_SDPARM_EXECFILE -c WCE /dev/sda
+      #sudo $MIDDL_SDPARM_EXECFILE -c WCE /dev/sdb
+    "
+
+# Install Collectl in middleware server nodes.
+# Version: 4.0.4
+- name: MiddlInstallCollectl404
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_COLLECTL_VERSION = "4.0.4"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_COLLECTL_EXECFILE = ""
+  bash: |
+    readonly MIDDL_COLLECTL_EXECFILE="/usr/bin/collectl"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/elba/mScopeResourceMonitors/collectl-${MIDDL_COLLECTL_VERSION}.src.tar.gz -C \
+          $MIDDL_FS_SOFTWAREDIR
+      cd $MIDDL_FS_SOFTWAREDIR/collectl*
+      sudo ./INSTALL
+    "
+
+# Initialize Collectl in middleware server nodes.
+# Version: 4.0.4
+- name: MiddlInitializeCollectl404
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_COLLECTL_VERSION = "4.0.4"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_COLLECTL_EXECFILE != ""
+    - $MIDDL_COLLECTL_INITIALIZEDAT = ""
+  bash: |
+    readonly MIDDL_COLLECTL_INITIALIZEDAT="$(date -u)"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      mkdir -p $MIDDL_FS_SOFTWAREDIR/collectl/data
+      nohup sudo nice -n -1 $MIDDL_COLLECTL_EXECFILE -sCDmnt -i.05 -oTm -P \
+          -f $MIDDL_FS_SOFTWAREDIR/collectl/data/coll > /dev/null 2>&1 &
+    "
+
+# Stop Collectl in middleware server nodes.
+# Version: 4.0.4
+- name: MiddlStopCollectl404
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_COLLECTL_VERSION = "4.0.4"
+    - $BENCH_FINISHEDAT != ""
+    - $MIDDL_COLLECTL_STOPPEDAT = ""
+  bash: |
+    readonly MIDDL_COLLECTL_STOPPEDAT="$(date -u)"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      sudo pkill collectl
+      sleep 2
+    "
+
+# Collect Collectl results in middleware server nodes.
+# Version: 4.0.4
+- name: MiddlCollectResultsCollectl404
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_COLLECTL_VERSION = "4.0.4"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_RESULTSDIR != ""
+    - $MIDDL_COLLECTL_STOPPEDAT != ""
+    - $MIDDL_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $MIDDL_COLLECTL_RESULTSDIR = ""
+  bash: |
+    readonly MIDDL_COLLECTL_RESULTSDIR="$MIDDL_FS_RESULTSDIR/collectl"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      mkdir -p $MIDDL_COLLECTL_RESULTSDIR
+      cp $MIDDL_FS_SOFTWAREDIR/collectl/data/coll-* $MIDDL_COLLECTL_RESULTSDIR
+      gzip -d $MIDDL_COLLECTL_RESULTSDIR/coll-*
+      cd $MIDDL_COLLECTL_RESULTSDIR
+      for result in \$(ls coll-*); do
+        if [ $MIDDL_CLOUD_NAME = 'emulab' ]; then
+          mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"_COLL_\"\$(NF)\".data\"}')
+        elif [ $MIDDL_CLOUD_NAME = 'cloudlab' ]; then
+          mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"-\"\$3\"_COLL_\"\$(NF)\".data\"}')
+        fi
+      done
+    "
+
+# Install RUBBoS in middleware server nodes.
+- name: MiddlInstallRubbos
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_RUBBOS_HOMEDIR = ""
+  bash: |
+    readonly MIDDL_RUBBOS_HOMEDIR="$MIDDL_FS_SOFTWAREDIR/rubbos_yasu"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/rubbos_yasu.tar.gz -C $MIDDL_FS_SOFTWAREDIR
+    "
+
+# Install Java Development Kit in middleware server nodes.
+# Version: 1.5.0
+- name: MiddlInstallJdk150
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_JAVA_VERSION = "1.5.0"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_JAVA_HOMEDIR = ""
+  bash: |
+    readonly MIDDL_JAVA_HOMEDIR="$MIDDL_FS_SOFTWAREDIR/java"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      sudo apt-get update
+      sudo apt-get -y install libc6:i386
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/software/jdk-${MIDDL_JAVA_VERSION}.tar.gz -C $MIDDL_FS_SOFTWAREDIR
+      mv $MIDDL_FS_SOFTWAREDIR/jdk* $MIDDL_JAVA_HOMEDIR
+    "
+
+# Install Java Development Kit in middleware server nodes.
+# Version: 1.6.0
+- name: MiddlInstallJdk160
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_JAVA_VERSION = "1.6.0"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_JAVA_HOMEDIR = ""
+  bash: |
+    readonly MIDDL_JAVA_HOMEDIR="$MIDDL_FS_SOFTWAREDIR/java"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/software/jdk-${MIDDL_JAVA_VERSION}.tar.gz -C $MIDDL_FS_SOFTWAREDIR
+      mv $MIDDL_FS_SOFTWAREDIR/jdk* $MIDDL_JAVA_HOMEDIR
+    "
+
+# Install C-JDBC using JDBC driver 5.1.7 in middleware server nodes.
+# Version: 2.0.2
+- name: MiddlInstallCjdbc202
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_JDBC_VERSION = "5.1.7"
+    - $MIDDL_CJDBC_VERSION = "2.0.2"
+    - $MIDDL_FS_SOFTWAREDIR != ""
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_CJDBC_LOGRESPONSETIME != ""
+    - $MIDDL_CJDBC_HOMEDIR = ""
+  bash: |
+    readonly MIDDL_CJDBC_HOMEDIR="$MIDDL_FS_SOFTWAREDIR/c-jdbc"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      tar -xzf $MIDDL_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/c-jdbc-${MIDDL_CJDBC_VERSION}-bin.tar.gz -C \
+          $MIDDL_FS_SOFTWAREDIR
+      mv $MIDDL_FS_SOFTWAREDIR/c-jdbc* $MIDDL_FS_SOFTWAREDIR/c-jdbc
+      cp $MIDDL_FS_ARTIFACTSDIR/lib/mysql-connector-java-${MIDDL_JDBC_VERSION}-bin.jar \
+          $MIDDL_FS_SOFTWAREDIR/c-jdbc/drivers
+      export MIDDL_CJDBC_LOGRESPONSETIME=\"$MIDDL_CJDBC_LOGRESPONSETIME\"
+      $MIDDL_FS_ARTIFACTSDIR/template/c-jdbc-${MIDDL_CJDBC_VERSION}/log4j.properties.sh > \
+          $MIDDL_FS_SOFTWAREDIR/c-jdbc/config/log4j.properties
+    "
+
+# Configure C-JDBC in middleware server nodes.
+# Version: 2.0.2
+- name: MiddlConfigureCjdbc202
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_CJDBC_VERSION = "2.0.2"
+    - $MIDDL_FS_ARTIFACTSDIR != ""
+    - $MIDDL_CJDBC_HOMEDIR != ""
+    - $MIDDL_CJDBC_CONNINITPOOLSIZE != ""
+    - $MIDDL_CJDBC_CONNMINPOOLSIZE != ""
+    - $MIDDL_CJDBC_CONNMAXPOOLSIZE != ""
+    - $MIDDL_CJDBC_CONNIDLETIMEOUT != ""
+    - $MIDDL_CJDBC_CONNWAITTIMEOUT != ""
+    - $DB_NET_NODES != ""
+    - $DB_NET_PORT != ""
+    - $DB_MYSQL_USER != ""
+    - $DB_MYSQL_PASSWORD != ""
+    - $DB_MYSQL_DATABASE != ""
+    - $MIDDL_NET_PORT = ""
+    - $MIDDL_CJDBC_CONTROLLERXMLPATH = ""
+  bash: |
+    readonly MIDDL_NET_PORT="25322"
+    readonly MIDDL_CJDBC_CONTROLLERXMLPATH="$MIDDL_CJDBC_HOMEDIR/config/controller/controller.xml"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      export MIDDL_NET_PORT=\"$MIDDL_NET_PORT\"
+      export MIDDL_CJDBC_CONNINITPOOLSIZE=\"$MIDDL_CJDBC_CONNINITPOOLSIZE\"
+      export MIDDL_CJDBC_CONNMINPOOLSIZE=\"$MIDDL_CJDBC_CONNMINPOOLSIZE\"
+      export MIDDL_CJDBC_CONNMAXPOOLSIZE=\"$MIDDL_CJDBC_CONNMAXPOOLSIZE\"
+      export MIDDL_CJDBC_CONNIDLETIMEOUT=\"$MIDDL_CJDBC_CONNIDLETIMEOUT\"
+      export MIDDL_CJDBC_CONNWAITTIMEOUT=\"$MIDDL_CJDBC_CONNWAITTIMEOUT\"
+      export DB_NET_NODES=\"$DB_NET_NODES\"
+      export DB_NET_PORT=\"$DB_NET_PORT\"
+      export DB_MYSQL_USER=\"$DB_MYSQL_USER\"
+      export DB_MYSQL_PASSWORD=\"$DB_MYSQL_PASSWORD\"
+      export DB_MYSQL_DATABASE=\"$DB_MYSQL_DATABASE\"
+      $MIDDL_FS_ARTIFACTSDIR/template/c-jdbc-${MIDDL_CJDBC_VERSION}/mysqldb.xml.sh > \
+          $MIDDL_CJDBC_HOMEDIR/config/virtualdatabase/mysqldb.xml
+      $MIDDL_FS_ARTIFACTSDIR/template/c-jdbc-${MIDDL_CJDBC_VERSION}/controller.xml.sh > $MIDDL_CJDBC_CONTROLLERXMLPATH
+    "
+
+# Initialize C-JDBC in middleware server nodes.
+# Version: 2.0.2
+- name: MiddlInitializeCjdbc202
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_CJDBC_VERSION = "2.0.2"
+    - $MIDDL_CJDBC_HOMEDIR != ""
+    - $MIDDL_CJDBC_CONTROLLERXMLPATH != ""
+    - $MIDDL_JAVA_HOMEDIR != ""
+    - $MIDDL_JAVA_MAXHEAPSIZEINMB != ""
+    - $DB_INITIALIZEDAT != ""
+    - $MIDDL_INITIALIZEDAT = ""
+  bash: |
+    readonly MIDDL_INITIALIZEDAT="$(date -u)"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      ulimit -n \$(ulimit -Hn)
+      export CJDBC_HOME=\"$MIDDL_CJDBC_HOMEDIR\"
+      export JAVA_HOME=\"$MIDDL_JAVA_HOMEDIR\"
+      export JAVA_OPTS=\"-Xmx${MIDDL_JAVA_MAXHEAPSIZEINMB}m\"
+      export PATH=\"$MIDDL_JAVA_HOMEDIR/bin:\$PATH\"
+      nohup $MIDDL_CJDBC_HOMEDIR/bin/controller.sh -f $MIDDL_CJDBC_CONTROLLERXMLPATH > /dev/null 2>&1 &
+    "
+    sleep 16
+
+# Stop C-JDBC in middleware server nodes.
+# Version: 2.0.2
+- name: MiddlStopCjdbc202
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_CJDBC_VERSION = "2.0.2"
+    - $BENCH_FINISHEDAT != ""
+    - $APP_TOMCAT_STOPPEDAT != ""
+    - $MIDDL_CJDBC_STOPPEDAT = ""
+  bash: |
+    readonly MIDDL_CJDBC_STOPPEDAT="$(date -u)"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      pkill -9 controller.sh
+      pkill -9 java
+      sleep 2
+    "
+
+# Collect C-JDBC results in middleware server nodes.
+# Version: 2.0.2
+- name: MiddlCollectResultsCjdbc202
+  guard:
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_CJDBC_VERSION = "2.0.2"
+    - $MIDDL_CJDBC_HOMEDIR != ""
+    - $MIDDL_FS_RESULTSDIR != ""
+    - $MIDDL_CJDBC_STOPPEDAT != ""
+    - $MIDDL_CJDBC_RESULTSDIR = ""
+  bash: |
+    readonly MIDDL_CJDBC_RESULTSDIR="$MIDDL_FS_RESULTSDIR/c-jdbc"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      mkdir -p $MIDDL_CJDBC_RESULTSDIR
+      cp $MIDDL_CJDBC_HOMEDIR/log/response_time.log \
+          $MIDDL_CJDBC_RESULTSDIR/\$(hostname -s)_CJDBC_mscope_response-time.log
+    "
+
+# Count the number of database server nodes.
+- name: DbCountNodes
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NNODES = ""
+  bash: |
+    DB_NNODES=0
+    local db_net_node
+    for db_net_node in $DB_NET_NODES; do
+      let DB_NNODES=DB_NNODES+1
+    done
+    readonly DB_NNODES
+
+# Reboot database server nodes.
+- name: DbReboot
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_DISKPARTITION != ""
+    - $DB_CPUFREQGOVERNOR in ['-', 'powersave', 'performance', 'ondemand']
+    - $DB_HARDWARE_REBOOTED = ""
+  bash: |
+    readonly DB_HARDWARE_REBOOTED="true"
+    local db_net_node
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        if [ $DB_CPUFREQGOVERNOR != '-' ]; then
+          sudo apt-get update
+          sudo apt-get -y install cpufrequtils
+          echo 'GOVERNOR=\"$DB_CPUFREQGOVERNOR\"' | sudo tee /etc/default/cpufrequtils
+          sudo systemctl disable ondemand
+        fi
+        nohup sudo systemctl reboot -i &>/dev/null & exit
+      "
+    done
+    sleep 240
+
+# Create a new disk partition /dev/sdb1 (128 GB) in database server nodes.
+- name: DbCreateDiskPartition
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $DB_FS_DISKPARTITION = ""
+  bash: |
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    local disk
+    local pno
+    if [ $DB_HARDWARE_TYPE = 'pc3000' ]; then
+      disk="/dev/sda"
+      pno=4
+      readonly DB_FS_DISKPARTITION="/dev/sda4"
+    elif [ $DB_HARDWARE_TYPE = 'c8220' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly DB_FS_DISKPARTITION="/dev/sdb1"
+    elif [ $DB_HARDWARE_TYPE = 'd430' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly DB_FS_DISKPARTITION="/dev/sdb1"
+    fi
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        echo -e \"n\np\n$pno\n\n+128G\nw\n\" | sudo fdisk $disk
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Make a ext3 filesystem on the created disk partition and mount it at the root directory in database server nodes.
+- name: DbMountExt3FilesystemAtRootDir
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_DISKPARTITION != ""
+    - $DB_HARDWARE_REBOOTED = "true"
+    - $DB_FS_ROOTDIR = ""
+  bash: |
+    readonly DB_FS_ROOTDIR="/mnt/experiment"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        sudo mkfs -F -t ext3 $DB_FS_DISKPARTITION
+        sudo mkdir -p $DB_FS_ROOTDIR
+        sudo mount $DB_FS_DISKPARTITION $DB_FS_ROOTDIR
+        sudo chown $DB_NET_USERNAME $DB_FS_ROOTDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Create a directory tree structure in database server nodes.
+- name: DbCreateDirectoryTreeStructure
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_ROOTDIR != ""
+    - $DB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $DB_FS_SOFTWAREDIR = ""
+    - $DB_FS_LIBDIR = ""
+    - $DB_FS_UTILDIR = ""
+    - $DB_FS_RESULTSDIR = ""
+    - $DB_FS_ARTIFACTSDIR = ""
+  bash: |
+    readonly DB_FS_SOFTWAREDIR="$DB_FS_ROOTDIR/software"
+    readonly DB_FS_LIBDIR="$DB_FS_ROOTDIR/lib"
+    readonly DB_FS_UTILDIR="$DB_FS_ROOTDIR/util"
+    readonly DB_FS_RESULTSDIR="$DB_FS_ROOTDIR/results"
+    readonly DB_FS_ARTIFACTSDIR="$DB_FS_ROOTDIR/artifacts"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        mkdir -p $DB_FS_SOFTWAREDIR
+        mkdir -p $DB_FS_LIBDIR
+        mkdir -p $DB_FS_UTILDIR
+        mkdir -p $DB_FS_RESULTSDIR
+        mkdir -p $DB_FS_ARTIFACTSDIR
+        if [ $DB_CLOUD_NAME = 'emulab' ]; then
+          tar -xzf /proj/Infosphere/ral/rubbos_artifacts.tar.gz -C $DB_FS_ARTIFACTSDIR
+        elif [ $DB_CLOUD_NAME = 'cloudlab' ]; then
+          tar -xzf /proj/infosphere-PG0/ral/rubbos_artifacts.tar.gz -C $DB_FS_ARTIFACTSDIR
+        fi
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install sdparm in database server nodes.
+# Version: 1.10
+- name: DbInstallSdparm110
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_UTILDIR != ""
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_HARDWARE_WCEMODE = "disable"
+    - $DB_SDPARM_VERSION = "1.10"
+    - $DB_SDPARM_EXECFILE = ""
+  bash: |
+    readonly DB_SDPARM_EXECFILE="/usr/local/bin/sdparm"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        tar -xzf $DB_FS_ARTIFACTSDIR/util/sdparm-${DB_SDPARM_VERSION}.tgz -C $DB_FS_UTILDIR
+        cd $DB_FS_UTILDIR/sdparm*
+        ./configure
+        make
+        sudo make install
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Disable "Write Cache Enabled" (WCE) mode in database server nodes.
+- name: DbDisableWceMode
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_SDPARM_EXECFILE != ""
+    - $DB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $DB_HARDWARE_WCEMODE = "disable"
+  bash: |
+    readonly DB_HARDWARE_WCEMODE="disabled"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        sudo $DB_SDPARM_EXECFILE -c WCE /dev/sda
+        #sudo $DB_SDPARM_EXECFILE -c WCE /dev/sdb
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Collectl in database server nodes.
+# Version: 4.0.4
+- name: DbInstallCollectl404
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_COLLECTL_VERSION = "4.0.4"
+    - $DB_FS_SOFTWAREDIR != ""
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_COLLECTL_EXECFILE = ""
+  bash: |
+    readonly DB_COLLECTL_EXECFILE="/usr/bin/collectl"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        tar -xzf $DB_FS_ARTIFACTSDIR/elba/mScopeResourceMonitors/collectl-${DB_COLLECTL_VERSION}.src.tar.gz -C \
+            $DB_FS_SOFTWAREDIR
+        cd $DB_FS_SOFTWAREDIR/collectl*
+        sudo ./INSTALL
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize Collectl in database server nodes.
+# Version: 4.0.4
+- name: DbInitializeCollectl404
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_COLLECTL_VERSION = "4.0.4"
+    - $DB_FS_SOFTWAREDIR != ""
+    - $DB_COLLECTL_EXECFILE != ""
+    - $DB_COLLECTL_INITIALIZEDAT = ""
+  bash: |
+    readonly DB_COLLECTL_INITIALIZEDAT="$(date -u)"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        mkdir -p $DB_FS_SOFTWAREDIR/collectl/data
+        nohup sudo nice -n -1 $DB_COLLECTL_EXECFILE -sCDmnt -i.05 -oTm -P \
+            -f $DB_FS_SOFTWAREDIR/collectl/data/coll > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Stop Collectl in database server nodes.
+# Version: 4.0.4
+- name: DbStopCollectl404
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_COLLECTL_VERSION = "4.0.4"
+    - $BENCH_FINISHEDAT != ""
+    - $DB_COLLECTL_STOPPEDAT = ""
+  bash: |
+    readonly DB_COLLECTL_STOPPEDAT="$(date -u)"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        sudo pkill collectl
+        sleep 2
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect Collectl results in database server nodes.
+# Version: 4.0.4
+- name: DbCollectResultsCollectl404
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_COLLECTL_VERSION = "4.0.4"
+    - $DB_FS_SOFTWAREDIR != ""
+    - $DB_FS_RESULTSDIR != ""
+    - $DB_COLLECTL_STOPPEDAT != ""
+    - $DB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $DB_COLLECTL_RESULTSDIR = ""
+  bash: |
+    readonly DB_COLLECTL_RESULTSDIR="$DB_FS_RESULTSDIR/collectl"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        mkdir -p $DB_COLLECTL_RESULTSDIR
+        cp $DB_FS_SOFTWAREDIR/collectl/data/coll-* $DB_COLLECTL_RESULTSDIR
+        gzip -d $DB_COLLECTL_RESULTSDIR/coll-*
+        cd $DB_COLLECTL_RESULTSDIR
+        for result in \$(ls coll-*); do
+          if [ $DB_CLOUD_NAME = 'emulab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"_COLL_\"\$(NF)\".data\"}')
+          elif [ $DB_CLOUD_NAME = 'cloudlab' ]; then
+            mv \$result \$(echo \$result | awk -F'[-.]' '{print \$2\"-\"\$3\"_COLL_\"\$(NF)\".data\"}')
+          fi
+        done
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install RUBBoS in database server nodes.
+- name: DbInstallRubbos
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_SOFTWAREDIR != ""
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_RUBBOS_HOMEDIR = ""
+  bash: |
+    readonly DB_RUBBOS_HOMEDIR="$DB_FS_SOFTWAREDIR/rubbos_yasu"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        tar -xzf $DB_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/rubbos_yasu.tar.gz -C $DB_FS_SOFTWAREDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install libaio in database server nodes.
+# Version: 0.3.111
+- name: DbInstallLibaio03111
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_FS_LIBDIR != ""
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_LIBAIO_VERSION = "0.3.111"
+    - $DB_LIBAIO_HOMEDIR = ""
+  bash: |
+    readonly DB_LIBAIO_HOMEDIR="$DB_FS_LIBDIR/libaio"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        mkdir -p $DB_LIBAIO_HOMEDIR
+        tar -xzf $DB_FS_ARTIFACTSDIR/lib/libaio-${DB_LIBAIO_VERSION}.tar.gz -C $DB_LIBAIO_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install MySQL in database server nodes.
+# Version: 5.6.40
+- name: DbInstallMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_FS_SOFTWAREDIR != ""
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_LIBAIO_HOMEDIR != ""
+    - $DB_MYSQL_HOMEDIR = ""
+  bash: |
+    readonly DB_MYSQL_HOMEDIR="$DB_FS_SOFTWAREDIR/mysql"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        export LD_LIBRARY_PATH=$DB_LIBAIO_HOMEDIR:\$LD_LIBRARY_PATH
+        tar -xzf $DB_FS_ARTIFACTSDIR/software/mysql-${DB_MYSQL_VERSION}-linux-glibc2.12-x86_64.tar.gz -C \
+            $DB_FS_SOFTWAREDIR
+        mv $DB_FS_SOFTWAREDIR/mysql* $DB_MYSQL_HOMEDIR
+        cd $DB_MYSQL_HOMEDIR
+        scripts/mysql_install_db --no-defaults --basedir=. --datadir=data
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Configure MySQL in database server nodes.
+# Version: 5.6.40
+- name: DbConfigureMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_MYSQL_HOMEDIR != ""
+    - $DB_NET_PORT = ""
+    - $DB_MYSQL_MYCNFPATH = ""
+  bash: |
+    readonly DB_NET_PORT="3313"
+    readonly DB_MYSQL_MYCNFPATH="$DB_MYSQL_HOMEDIR/my.cnf"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        export DB_NET_PORT=\"$DB_NET_PORT\"
+        $DB_FS_ARTIFACTSDIR/template/mysql-${DB_MYSQL_VERSION}/my.cnf.sh > $DB_MYSQL_MYCNFPATH
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Setup MySQL in database server nodes.
+# Version: 5.6.40
+- name: DbSetupMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_MYSQL_HOMEDIR != ""
+    - $DB_LIBAIO_HOMEDIR != ""
+    - $DB_MYSQL_USER = ""
+    - $DB_MYSQL_PASSWORD = ""
+    - $DB_MYSQL_DATABASE = ""
+  bash: |
+    readonly DB_MYSQL_USER="elba"
+    readonly DB_MYSQL_PASSWORD="G3orgi@7ech"
+    readonly DB_MYSQL_DATABASE="rubbos"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        export LD_LIBRARY_PATH=$DB_LIBAIO_HOMEDIR:\$LD_LIBRARY_PATH
+        cd $DB_MYSQL_HOMEDIR
+        nohup bin/mysqld_safe --no-defaults --skip-networking --socket=/tmp/mysql.sock --user=root --basedir=. \
+            --datadir=data > /dev/null 2>&1 &
+        sleep 16
+        echo \"CREATE USER '$DB_MYSQL_USER'@'%'\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"SET PASSWORD FOR '$DB_MYSQL_USER'@'%' = PASSWORD('$DB_MYSQL_PASSWORD')\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"GRANT ALL PRIVILEGES ON *.* TO '$DB_MYSQL_USER'@'%'\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"CREATE USER '$DB_MYSQL_USER'@'localhost'\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"SET PASSWORD FOR '$DB_MYSQL_USER'@'localhost' = PASSWORD('$DB_MYSQL_PASSWORD')\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"GRANT ALL PRIVILEGES ON *.* TO '$DB_MYSQL_USER'@'localhost'\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=root mysql
+        echo \"CREATE DATABASE $DB_MYSQL_DATABASE\" | \
+            bin/mysql --socket=/tmp/mysql.sock --user=$DB_MYSQL_USER --password=$DB_MYSQL_PASSWORD mysql
+        bin/mysqladmin --socket=/tmp/mysql.sock --user=root shutdown
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Initialize MySQL in database server nodes.
+# Version: 5.6.40
+- name: DbInitializeMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_FS_ARTIFACTSDIR != ""
+    - $DB_LIBAIO_HOMEDIR != ""
+    - $DB_MYSQL_HOMEDIR != ""
+    - $DB_MYSQL_MYCNFPATH != ""
+    - $DB_MYSQL_DATABASE != ""
+    - $DB_MYSQL_MAXCONNECTIONS != ""
+    - $DB_INITIALIZEDAT = ""
+  bash: |
+    readonly DB_INITIALIZEDAT="$(date -u)"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        export LD_LIBRARY_PATH=$DB_LIBAIO_HOMEDIR:\$LD_LIBRARY_PATH
+        ulimit -n \$(ulimit -Hn)
+        cd $DB_MYSQL_HOMEDIR
+        tar -xzf $DB_FS_ARTIFACTSDIR/data/rubbos_orig_data.tar.gz --directory=data/$DB_MYSQL_DATABASE
+        nohup bin/mysqld_safe --defaults-file=\"$DB_MYSQL_MYCNFPATH\" --user=root --basedir=. --datadir=data \
+            --log-bin=$DB_MYSQL_DATABASE-bin --max_connections=$DB_MYSQL_MAXCONNECTIONS --slow_query_log \
+            --long_query_time=1 --slow_query_log_file=\"mysql_slow.log\" > /dev/null 2>&1 &
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+    sleep 16
+
+# Stop MySQL in database server nodes.
+# Version: 5.6.40
+- name: DbStopMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_MYSQL_HOMEDIR != ""
+    - $DB_LIBAIO_HOMEDIR != ""
+    - $BENCH_FINISHEDAT != ""
+    - $MIDDL_CJDBC_STOPPEDAT != ""
+    - $DB_MYSQL_STOPPEDAT = ""
+  bash: |
+    readonly DB_MYSQL_STOPPEDAT="$(date -u)"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        export LD_LIBRARY_PATH=$DB_LIBAIO_HOMEDIR:\$LD_LIBRARY_PATH
+        cd $DB_MYSQL_HOMEDIR
+        bin/mysqladmin --socket=/tmp/mysql.sock --user=root shutdown
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Collect MySQL results in database server nodes.
+# Version: 5.6.40
+- name: DbCollectResultsMySql5640
+  guard:
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_MYSQL_VERSION = "5.6.40"
+    - $DB_MYSQL_HOMEDIR != ""
+    - $DB_FS_RESULTSDIR != ""
+    - $DB_MYSQL_STOPPEDAT != ""
+    - $DB_MYSQL_RESULTSDIR = ""
+  bash: |
+    readonly DB_MYSQL_RESULTSDIR="$DB_FS_RESULTSDIR/mysql"
+    local db_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        mkdir -p $DB_MYSQL_RESULTSDIR
+        cp $DB_MYSQL_HOMEDIR/data/mysql_slow.log $DB_MYSQL_RESULTSDIR/\$(hostname -s)_MYSQL_slow.log
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Count the number of client nodes.
+- name: ClientCountNodes
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NNODES = ""
+  bash: |
+    CLIENT_NNODES=0
+    local client_net_node
+    for client_net_node in $CLIENT_NET_NODES; do
+      let CLIENT_NNODES=CLIENT_NNODES+1
+    done
+    readonly CLIENT_NNODES
+
+# Reboot client nodes.
+- name: ClientReboot
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_FS_DISKPARTITION != ""
+    - $CLIENT_HARDWARE_REBOOTED = ""
+  bash: |
+    readonly CLIENT_HARDWARE_REBOOTED="true"
+    local client_net_node
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        nohup sudo systemctl reboot -i &>/dev/null & exit
+      "
+    done
+    sleep 240
+
+# Create a new disk partition /dev/sdb1 (128 GB) in client nodes.
+- name: ClientCreateDiskPartition
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $CLIENT_FS_DISKPARTITION = ""
+  bash: |
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    local disk
+    local pno
+    if [ $CLIENT_HARDWARE_TYPE = 'pc3000' ]; then
+      disk="/dev/sda"
+      pno=4
+      readonly CLIENT_FS_DISKPARTITION="/dev/sda4"
+    elif [ $CLIENT_HARDWARE_TYPE = 'c8220' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly CLIENT_FS_DISKPARTITION="/dev/sdb1"
+    elif [ $CLIENT_HARDWARE_TYPE = 'd430' ]; then
+      disk="/dev/sdb"
+      pno=1
+      readonly CLIENT_FS_DISKPARTITION="/dev/sdb1"
+    fi
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        echo -e \"n\np\n$pno\n\n+128G\nw\n\" | sudo fdisk $disk
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Make a ext3 filesystem on the created disk partition and mount it at the root directory in client nodes.
+- name: ClientMountExt3FilesystemAtRootDir
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_FS_DISKPARTITION != ""
+    - $CLIENT_HARDWARE_REBOOTED = "true"
+    - $CLIENT_FS_ROOTDIR = ""
+  bash: |
+    readonly CLIENT_FS_ROOTDIR="/mnt/experiment"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        sudo mkfs -F -t ext3 $CLIENT_FS_DISKPARTITION
+        sudo mkdir -p $CLIENT_FS_ROOTDIR
+        sudo mount $CLIENT_FS_DISKPARTITION $CLIENT_FS_ROOTDIR
+        sudo chown $CLIENT_NET_USERNAME $CLIENT_FS_ROOTDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Create a directory tree structure in client nodes.
+- name: ClientCreateDirectoryTreeStructure
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_FS_ROOTDIR != ""
+    - $CLIENT_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $CLIENT_FS_SOFTWAREDIR = ""
+    - $CLIENT_FS_LIBDIR = ""
+    - $CLIENT_FS_UTILDIR = ""
+    - $CLIENT_FS_RESULTSDIR = ""
+    - $CLIENT_FS_ARTIFACTSDIR = ""
+  bash: |
+    readonly CLIENT_FS_SOFTWAREDIR="$CLIENT_FS_ROOTDIR/software"
+    readonly CLIENT_FS_LIBDIR="$CLIENT_FS_ROOTDIR/lib"
+    readonly CLIENT_FS_UTILDIR="$CLIENT_FS_ROOTDIR/util"
+    readonly CLIENT_FS_RESULTSDIR="$CLIENT_FS_ROOTDIR/results"
+    readonly CLIENT_FS_ARTIFACTSDIR="$CLIENT_FS_ROOTDIR/artifacts"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        mkdir -p $CLIENT_FS_SOFTWAREDIR
+        mkdir -p $CLIENT_FS_LIBDIR
+        mkdir -p $CLIENT_FS_UTILDIR
+        mkdir -p $CLIENT_FS_RESULTSDIR
+        mkdir -p $CLIENT_FS_ARTIFACTSDIR
+        if [ $CLIENT_CLOUD_NAME = 'emulab' ]; then
+          tar -xzf /proj/Infosphere/ral/rubbos_artifacts.tar.gz -C $CLIENT_FS_ARTIFACTSDIR
+        elif [ $CLIENT_CLOUD_NAME = 'cloudlab' ]; then
+          tar -xzf /proj/infosphere-PG0/ral/rubbos_artifacts.tar.gz -C $CLIENT_FS_ARTIFACTSDIR
+        fi
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install milliScope LKMs in client nodes.
+# TODO: Parameterize network filesystem paths.
+# TODO: Parameterize milliScope version.
+# TODO: Remove Emulab dependency.
+- name: ClientInstallMilliScopeLKMs
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $CLIENT_FS_SOFTWAREDIR != ""
+    - $CLIENT_MILLISCOPE_LKM = ""
+  bash: |
+    readonly CLIENT_MILLISCOPE_LKM="$CLIENT_FS_SOFTWAREDIR/milliScope/src/milliScope.ko"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        if [ $CLIENT_CLOUD_NAME = 'emulab' ]; then
+          tar -xzf /proj/Infosphere/ral/milliScope.tar.gz -C $CLIENT_FS_SOFTWAREDIR
+          cd $CLIENT_FS_SOFTWAREDIR/milliScope/src
+          make
+        elif [ $CLIENT_CLOUD_NAME = 'cloudlab' ]; then
+          tar -xzf /proj/infosphere-PG0/ral/milliScope.tar.gz -C $CLIENT_FS_SOFTWAREDIR
+          cd $CLIENT_FS_SOFTWAREDIR/milliScope/src
+          make
+        fi
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Java Development Kit in client nodes.
+# Version: 1.5.0
+- name: ClientInstallJdk150
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_JAVA_VERSION = "1.5.0"
+    - $CLIENT_FS_SOFTWAREDIR != ""
+    - $CLIENT_FS_ARTIFACTSDIR != ""
+    - $CLIENT_JAVA_HOMEDIR = ""
+  bash: |
+    readonly CLIENT_JAVA_HOMEDIR="$CLIENT_FS_SOFTWAREDIR/java"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        sudo apt-get update
+        sudo apt-get -y install libc6:i386
+        tar -xzf $CLIENT_FS_ARTIFACTSDIR/software/jdk-${CLIENT_JAVA_VERSION}.tar.gz -C $CLIENT_FS_SOFTWAREDIR
+        mv $CLIENT_FS_SOFTWAREDIR/jdk* $CLIENT_JAVA_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install Java Development Kit in client nodes.
+# Version: 1.6.0
+- name: ClientInstallJdk160
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_JAVA_VERSION = "1.6.0"
+    - $CLIENT_FS_SOFTWAREDIR != ""
+    - $CLIENT_FS_ARTIFACTSDIR != ""
+    - $CLIENT_JAVA_HOMEDIR = ""
+  bash: |
+    readonly CLIENT_JAVA_HOMEDIR="$CLIENT_FS_SOFTWAREDIR/java"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        tar -xzf $CLIENT_FS_ARTIFACTSDIR/software/jdk-${CLIENT_JAVA_VERSION}.tar.gz -C $CLIENT_FS_SOFTWAREDIR
+        mv $CLIENT_FS_SOFTWAREDIR/jdk* $CLIENT_JAVA_HOMEDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Install RUBBoS in client nodes.
+- name: ClientInstallRubbos
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_FS_SOFTWAREDIR != ""
+    - $CLIENT_FS_ARTIFACTSDIR != ""
+    - $CLIENT_RUBBOS_HOMEDIR = ""
+  bash: |
+    readonly CLIENT_RUBBOS_HOMEDIR="$CLIENT_FS_SOFTWAREDIR/rubbos_yasu"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        tar -xzf $CLIENT_FS_ARTIFACTSDIR/elba/mScopeEventMonitors/rubbos_yasu.tar.gz -C $CLIENT_FS_SOFTWAREDIR
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Compile RUBBoS client in client nodes.
+- name: ClientCompileRubbosClient
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_JAVA_HOMEDIR != ""
+    - $CLIENT_RUBBOS_HOMEDIR != ""
+    - $CLIENT_RUBBOS_CLIENTCLASSESDIR = ""
+  bash: |
+    readonly CLIENT_RUBBOS_CLIENTCLASSESDIR="$CLIENT_RUBBOS_HOMEDIR/client/classes"
+    local client_net_node
+    local sessions=()
+    local n_sessions=0
+    local session
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        export JAVA_HOME=\"$CLIENT_JAVA_HOMEDIR\"
+        export PATH=\"$CLIENT_JAVA_HOMEDIR/bin:\$PATH\"
+        mkdir -p $CLIENT_RUBBOS_CLIENTCLASSESDIR
+        cd $CLIENT_RUBBOS_HOMEDIR/client
+        javac src/java/edu/rice/rubbos/client/*.java src/java/edu/rice/rubbos/beans/*.java -d classes
+      " &
+      sessions[$n_sessions]=$!
+      let n_sessions=n_sessions+1
+    done
+    for session in ${sessions[*]}; do
+      wait $session
+    done
+
+# Configure RUBBoS client in client nodes.
+- name: ClientConfigureRubbosClient
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_PORT != ""
+    - $CLIENT_NNODES != ""
+    - $CLIENT_RUBBOS_HOMEDIR != ""
+    - $BENCH_TYPE in ['browse-only', 'read-write']
+    - $BENCH_WORKLOAD != ""
+    - $BENCH_UPRAMPTIMEINMS != ""
+    - $BENCH_SESSIONRUNTIMEINMS != ""
+    - $BENCH_DOWNRAMPTIMEINMS != ""
+    - $CLIENT_FS_ARTIFACTSDIR != ""
+    - $CLIENT_RUBBOS_CLIENTCONFDIR = ""
+  bash: |
+    readonly CLIENT_RUBBOS_CLIENTCONFDIR="$CLIENT_RUBBOS_HOMEDIR/client/conf"
+    local client_net_node
+    local web_net_node
+    for client_net_node in $CLIENT_NET_NODES; do
+      for web_net_node in $WEB_NET_NODES; do
+        ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+            $CLIENT_NET_USERNAME@$client_net_node "
+          mkdir -p $CLIENT_RUBBOS_CLIENTCONFDIR
+          if [ $BENCH_TYPE = 'browse-only' ]; then
+            export BENCH_USERTRANSITIONTABLE=\"$CLIENT_RUBBOS_HOMEDIR/workload/browse_only_transitions.txt\"
+            export BENCH_AUTHORTRANSITIONTABLE=\"$CLIENT_RUBBOS_HOMEDIR/workload/browse_only_transitions.txt\"
+          elif [ $BENCH_TYPE = 'read-write' ]; then
+            export BENCH_USERTRANSITIONTABLE=\"$CLIENT_RUBBOS_HOMEDIR/workload/user_default_transitions.txt\"
+            export BENCH_AUTHORTRANSITIONTABLE=\"$CLIENT_RUBBOS_HOMEDIR/workload/author_default_transitions.txt\"
+          fi
+          export BENCH_NUMBEROFCLIENTSPERNODE=\"$(($BENCH_WORKLOAD/$CLIENT_NNODES))\"
+          export BENCH_UPRAMPTIMEINMS=\"$BENCH_UPRAMPTIMEINMS\"
+          export BENCH_SESSIONRUNTIMEINMS=\"$BENCH_SESSIONRUNTIMEINMS\"
+          export BENCH_DOWNRAMPTIMEINMS=\"$BENCH_DOWNRAMPTIMEINMS\"
+          export BENCH_DICTIONARY=\"$CLIENT_RUBBOS_HOMEDIR/bench/dictionary\"
+          export WEB_NET_NODE=\"$web_net_node\"
+          export WEB_NET_PORT=\"$WEB_NET_PORT\"
+          $CLIENT_FS_ARTIFACTSDIR/template/rubbos_yasu/rubbos.properties.sh > \
+              $CLIENT_RUBBOS_HOMEDIR/client/conf/${web_net_node//\./}.properties
+        "
+      done
+    done
+
+# Run benchmark.
+- name: BenchRun
+  guard:
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $CLIENT_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $CLIENT_JAVA_HOMEDIR != ""
+    - $CLIENT_RUBBOS_HOMEDIR != ""
+    - $CLIENT_RUBBOS_CLIENTCLASSESDIR != ""
+    - $CLIENT_RUBBOS_CLIENTCONFDIR != ""
+    - $CLIENT_MILLISCOPE_LKM != ""
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $WEB_HARDWARE_WCEMODE in ['disabled', 'enabled']
+    - $WEB_COLLECTL_INITIALIZEDAT != ""
+    - $WEB_RUBBOS_HOMEDIR != ""
+    - $WEB_INITIALIZEDAT != ""
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $APP_HARDWARE_WCEMODE in ['disabled', 'enabled']
+    - $APP_COLLECTL_INITIALIZEDAT != ""
+    - $APP_RUBBOS_HOMEDIR != ""
+    - $APP_INITIALIZEDAT != ""
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $MIDDL_HARDWARE_WCEMODE in ['disabled', 'enabled']
+    - $MIDDL_COLLECTL_INITIALIZEDAT != ""
+    - $MIDDL_RUBBOS_HOMEDIR != ""
+    - $MIDDL_INITIALIZEDAT != ""
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_HARDWARE_TYPE in ['c8220', 'pc3000', 'd430']
+    - $DB_HARDWARE_WCEMODE in ['disabled', 'enabled']
+    - $DB_COLLECTL_INITIALIZEDAT != ""
+    - $DB_RUBBOS_HOMEDIR != ""
+    - $DB_INITIALIZEDAT != ""
+    - $BENCH_FINISHEDAT = ""
+  bash: |
+    local web_net_node
+    local app_net_node
+    local db_net_node
+    local client_net_node
+
+    # Flush memory in cache.
+    local flush_session
+    local flush_sessions=()
+    local n_flush_sessions
+    n_flush_sessions=0
+    for web_net_node in $WEB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $WEB_NET_USERNAME@$web_net_node "
+        gcc -o $WEB_RUBBOS_HOMEDIR/bench/flush_cache $WEB_RUBBOS_HOMEDIR/bench/flush_cache.c
+        if [ $WEB_HARDWARE_TYPE = 'c8220' ]; then
+          $WEB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $WEB_HARDWARE_TYPE = 'pc3000' ]; then
+          $WEB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $WEB_HARDWARE_TYPE = 'd430' ]; then
+          $WEB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        fi
+      " &
+      flush_sessions[$n_flush_sessions]=$!
+      let n_flush_sessions=n_flush_sessions+1
+    done
+    for app_net_node in $APP_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $APP_NET_USERNAME@$app_net_node "
+        gcc -o $APP_RUBBOS_HOMEDIR/bench/flush_cache $APP_RUBBOS_HOMEDIR/bench/flush_cache.c
+        if [ $APP_HARDWARE_TYPE = 'c8220' ]; then
+          $APP_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $APP_HARDWARE_TYPE = 'pc3000' ]; then
+          $APP_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $APP_HARDWARE_TYPE = 'd430' ]; then
+          $APP_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        fi
+      " &
+      flush_sessions[$n_flush_sessions]=$!
+      let n_flush_sessions=n_flush_sessions+1
+    done
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $MIDDL_NET_USERNAME@$MIDDL_NET_NODE "
+      gcc -o $MIDDL_RUBBOS_HOMEDIR/bench/flush_cache $MIDDL_RUBBOS_HOMEDIR/bench/flush_cache.c
+      if [ $MIDDL_HARDWARE_TYPE = 'c8220' ]; then
+        $MIDDL_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+      elif [ $MIDDL_HARDWARE_TYPE = 'pc3000' ]; then
+        $MIDDL_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+      elif [ $MIDDL_HARDWARE_TYPE = 'd430' ]; then
+        $MIDDL_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+      fi
+    " &
+    flush_sessions[$n_flush_sessions]=$!
+    let n_flush_sessions=n_flush_sessions+1
+    for db_net_node in $DB_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $DB_NET_USERNAME@$db_net_node "
+        gcc -o $DB_RUBBOS_HOMEDIR/bench/flush_cache $DB_RUBBOS_HOMEDIR/bench/flush_cache.c
+        if [ $DB_HARDWARE_TYPE = 'c8220' ]; then
+          $DB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $DB_HARDWARE_TYPE = 'pc3000' ]; then
+          $DB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $DB_HARDWARE_TYPE = 'd430' ]; then
+          $DB_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        fi
+      " &
+      flush_sessions[$n_flush_sessions]=$!
+      let n_flush_sessions=n_flush_sessions+1
+    done
+    for client_net_node in $CLIENT_NET_NODES; do
+      ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+          $CLIENT_NET_USERNAME@$client_net_node "
+        gcc -o $CLIENT_RUBBOS_HOMEDIR/bench/flush_cache $CLIENT_RUBBOS_HOMEDIR/bench/flush_cache.c
+        if [ $CLIENT_HARDWARE_TYPE = 'c8220' ]; then
+          $CLIENT_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $CLIENT_HARDWARE_TYPE = 'pc3000' ]; then
+          $CLIENT_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        elif [ $CLIENT_HARDWARE_TYPE = 'd430' ]; then
+          $CLIENT_RUBBOS_HOMEDIR/bench/flush_cache 2000000
+        fi
+      " &
+      flush_sessions[$n_flush_sessions]=$!
+      let n_flush_sessions=n_flush_sessions+1
+    done
+    for flush_session in ${flush_sessions[*]}; do
+      wait $flush_session
+    done
+
+    # Workload
+    local client_session
+    local client_sessions=()
+    local n_client_sessions
+    n_client_sessions=0
+    for client_net_node in $CLIENT_NET_NODES; do
+      for web_net_node in $WEB_NET_NODES; do
+        ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+            $CLIENT_NET_USERNAME@$client_net_node "
+          sudo sysctl -w net.ipv4.ip_local_port_range=\"1024 65535\"
+          sudo bash -c \"echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse\"
+          sudo bash -c \"echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout\"
+          sudo insmod $CLIENT_MILLISCOPE_LKM
+          ulimit -n \$(ulimit -Hn)
+          export JAVA_HOME=\"$CLIENT_JAVA_HOMEDIR\"
+          export PATH=\"$CLIENT_JAVA_HOMEDIR/bin:\$PATH\"
+          java -classpath $CLIENT_RUBBOS_CLIENTCLASSESDIR:$CLIENT_RUBBOS_CLIENTCONFDIR \
+              edu.rice.rubbos.client.SimpleClientEmulator ${web_net_node//\./} &
+          JAVA_PID=\$!
+          wait \$JAVA_PID
+          echo \$JAVA_PID > ~/java.pid
+          cat /proc/milliScope_connect > ~/milliScope_connect.csv
+          cat /proc/milliScope_sendto > ~/milliScope_sendto.csv
+          cat /proc/milliScope_recvfrom > ~/milliScope_recvfrom.csv
+          sudo rmmod $CLIENT_MILLISCOPE_LKM
+        " &
+        client_sessions[$n_client_sessions]=$!
+        let n_client_sessions=n_client_sessions+1
+      done
+    done
+    for client_session in ${client_sessions[*]}; do
+      wait $client_session
+    done
+    readonly BENCH_FINISHEDAT="$(date -u)"
+
+# Create a tarball with the benchmark results.
+- name: BenchCollectResults
+  guard:
+    - $APP_JAVA_VERSION != ""
+    - $BENCH_WORKLOAD != ""
+    - $CLIENT_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $WEB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $APP_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $MIDDL_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $DB_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $BENCH_CLOUD_NAME in ['emulab', 'cloudlab']
+    - $BENCH_NET_NODE != ""
+    - $BENCH_NET_USERNAME != ""
+    - $CLIENT_NET_NODES != ""
+    - $CLIENT_NET_USERNAME != ""
+    - $WEB_NET_NODES != ""
+    - $WEB_NET_USERNAME != ""
+    - $WEB_COLLECTL_RESULTSDIR != ""
+    - $WEB_HTTPD_RESULTSDIR != ""
+    - $APP_NET_NODES != ""
+    - $APP_NET_USERNAME != ""
+    - $APP_COLLECTL_RESULTSDIR != ""
+    - $APP_TOMCAT_RESULTSDIR != ""
+    - $MIDDL_NET_NODE != ""
+    - $MIDDL_NET_USERNAME != ""
+    - $MIDDL_COLLECTL_RESULTSDIR != ""
+    - $MIDDL_CJDBC_RESULTSDIR != ""
+    - $DB_NET_NODES != ""
+    - $DB_NET_USERNAME != ""
+    - $DB_COLLECTL_RESULTSDIR != ""
+    - $DB_MYSQL_RESULTSDIR != ""
+    - $BENCH_RESULTSTARBALL = ""
+  bash: |
+    readonly BENCH_RESULTSTARBALL="$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 64; echo '').tar.gz"
+    ssh -T -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o BatchMode=yes \
+        $BENCH_NET_USERNAME@$BENCH_NET_NODE "
+      mkdir results
+      for client_net_node in $CLIENT_NET_NODES; do
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $CLIENT_NET_USERNAME@\$client_net_node:milliScope_connect.csv results
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $CLIENT_NET_USERNAME@\$client_net_node:milliScope_sendto.csv results
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $CLIENT_NET_USERNAME@\$client_net_node:milliScope_recvfrom.csv results
+      done
+      for web_net_node in $WEB_NET_NODES; do
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $WEB_NET_USERNAME@\$web_net_node:$WEB_COLLECTL_RESULTSDIR/* results
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $WEB_NET_USERNAME@\$web_net_node:$WEB_HTTPD_RESULTSDIR/* results
+      done
+      for app_net_node in $APP_NET_NODES; do
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $APP_NET_USERNAME@\$app_net_node:$APP_COLLECTL_RESULTSDIR/* results
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $APP_NET_USERNAME@\$app_net_node:$APP_TOMCAT_RESULTSDIR/* results
+      done
+      scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+          $MIDDL_NET_USERNAME@$MIDDL_NET_NODE:$MIDDL_COLLECTL_RESULTSDIR/* results
+      scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+          $MIDDL_NET_USERNAME@$MIDDL_NET_NODE:$MIDDL_CJDBC_RESULTSDIR/* results
+      for db_net_node in $DB_NET_NODES; do
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $DB_NET_USERNAME@\$db_net_node:$DB_COLLECTL_RESULTSDIR/* results
+        scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+            $DB_NET_USERNAME@\$db_net_node:$DB_MYSQL_RESULTSDIR/* results
+      done
+      tar -czf $BENCH_RESULTSTARBALL -C results .
+      rm -rf results
+    "
+...
